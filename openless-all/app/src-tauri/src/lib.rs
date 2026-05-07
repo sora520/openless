@@ -12,8 +12,10 @@
 
 mod asr;
 mod audio_mute;
+mod combo_hotkey;
 mod commands;
 mod coordinator;
+mod global_hotkey_runtime;
 mod hotkey;
 mod insertion;
 mod permissions;
@@ -22,6 +24,7 @@ mod polish;
 mod qa_hotkey;
 mod recorder;
 mod selection;
+mod shortcut_binding;
 mod types;
 mod windows_ime_ipc;
 mod windows_ime_profile;
@@ -32,13 +35,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "macos")]
 use std::sync::mpsc;
 use std::sync::Arc;
-#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 /// 第一次 show 时把 QA 浮窗摆到屏幕底部居中；之后的 show 不再 reposition，
 /// 让用户拖动后的位置在 hide → show 之间得以保持。详见 issue #118 v2。
 static QA_WINDOW_POSITIONED: AtomicBool = AtomicBool::new(false);
-use tauri::menu::{MenuBuilder, MenuItemBuilder};
+static TRAY_MICROPHONE_WATCHER_STOPPING: AtomicBool = AtomicBool::new(false);
+use tauri::menu::{
+    CheckMenuItemBuilder, Menu, MenuBuilder, MenuItemBuilder, Submenu, SubmenuBuilder,
+};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, RunEvent, Runtime};
 
@@ -72,6 +77,8 @@ pub fn run() {
         ))
         .manage(coordinator.clone())
         .manage(local_asr_download_manager.clone())
+        .manage(commands::MicrophoneMonitorState::new(None))
+        .manage(commands::TrayMicrophoneMenuState::new(Vec::new()))
         .setup(move |app| {
             // Capsule 启动时定位到屏幕底部居中并隐藏；coordinator 按需显示。
             // 与 Swift `CapsuleWindowController.repositionToBottomCenter` 同语义。
@@ -148,33 +155,45 @@ pub fn run() {
 
             // 菜单栏图标 — 与 Swift `MenuBarController` 同语义：
             // 左键点 → 显示/聚焦主窗口；菜单含「显示主窗口」「退出」。
-            let toggle = MenuItemBuilder::with_id("toggle", "显示主窗口").build(app)?;
-            let quit = MenuItemBuilder::with_id("quit", "退出 OpenLess").build(app)?;
-            let menu = MenuBuilder::new(app).items(&[&toggle, &quit]).build()?;
+            let tray_menu = build_tray_menu(app, &coordinator)?;
+            let menu = tray_menu.menu;
 
             // 与 Swift `StatusBarIcon.swift` 行为一致：用全彩 AppIcon，**不**走 template 模式
             // （走 template 会被 macOS 染成单色 → 看起来像个黑方块）。
             if let Some(icon) = app.default_window_icon() {
+                {
+                    let state = app.state::<commands::TrayMicrophoneMenuState>();
+                    *state.lock() = tray_menu.microphone_items;
+                }
                 let _tray = TrayIconBuilder::with_id("main-tray")
                     .icon(icon.clone())
                     .icon_as_template(false)
                     .menu(&menu)
                     .show_menu_on_left_click(false)
-                    .on_menu_event(|app, event| match event.id.as_ref() {
+                    .on_menu_event(move |app, event| match event.id.as_ref() {
                         "toggle" => show_main_window(app),
                         "quit" => app.exit(0),
-                        _ => {}
+                        id => handle_microphone_tray_menu_event(
+                            app,
+                            id,
+                        ),
                     })
-                    .on_tray_icon_event(|tray, event| {
-                        if let TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            ..
-                        } = event
-                        {
-                            show_main_window(tray.app_handle());
+                    .on_tray_icon_event(move |tray, event| {
+                        match event {
+                            TrayIconEvent::Enter { .. } => {
+                                if let Err(err) = refresh_tray_microphone_menu(tray.app_handle()) {
+                                    log::warn!("[tray] refresh microphone menu on hover failed: {err}");
+                                }
+                            }
+                            TrayIconEvent::Click {
+                                button: MouseButton::Left,
+                                ..
+                            } => show_main_window(tray.app_handle()),
+                            _ => {}
                         }
                     })
                     .build(app)?;
+                start_tray_microphone_watcher(app.handle().clone());
             } else {
                 log::warn!("[startup] default window icon missing; tray icon disabled");
             }
@@ -183,8 +202,8 @@ pub fn run() {
             let app_handle = app.handle().clone();
             coordinator.bind_app(app_handle);
             coordinator.start_hotkey_listener();
-            // 同步启动 QA hotkey listener。和 dictation hotkey 平行，互不抢状态。
-            coordinator.start_qa_hotkey_listener();
+            // QA / custom combo hotkeys use `global-hotkey` (Carbon on macOS).
+            // Start those after RunEvent::Ready, when the AppKit event loop is live.
             if std::env::var("OPENLESS_SHOW_MAIN_ON_START").ok().as_deref() == Some("1") {
                 show_main_window(app.handle());
             }
@@ -196,7 +215,11 @@ pub fn run() {
             commands::set_settings,
             commands::get_hotkey_status,
             commands::get_hotkey_capability,
+            commands::set_shortcut_recording_active,
             commands::get_windows_ime_status,
+            commands::list_microphone_devices,
+            commands::start_microphone_level_monitor,
+            commands::stop_microphone_level_monitor,
             commands::get_credentials,
             commands::set_credential,
             commands::list_history,
@@ -228,8 +251,15 @@ pub fn run() {
             commands::set_active_llm_provider,
             commands::get_qa_hotkey_label,
             commands::set_qa_hotkey,
+            commands::validate_shortcut_binding,
+            commands::set_dictation_hotkey,
+            commands::set_translation_hotkey,
+            commands::set_switch_style_hotkey,
+            commands::set_open_app_hotkey,
             commands::qa_window_dismiss,
             commands::qa_window_pin,
+            commands::validate_combo_hotkey,
+            commands::set_combo_hotkey,
             commands::validate_provider_credentials,
             commands::list_provider_models,
             commands::local_asr_get_settings,
@@ -251,6 +281,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| match event {
+            RunEvent::Ready => {
+                let coordinator = app.state::<Arc<coordinator::Coordinator>>();
+                // 同步启动 QA hotkey listener。和 dictation hotkey 平行，互不抢状态。
+                coordinator.start_qa_hotkey_listener();
+                // 启动自定义组合键监听器。当 trigger == Custom 时替代 modifier-only 监听器。
+                coordinator.start_combo_hotkey_listener();
+                coordinator.start_translation_hotkey_listener();
+                coordinator.start_switch_style_hotkey_listener();
+                coordinator.start_open_app_hotkey_listener();
+            }
             #[cfg(target_os = "macos")]
             RunEvent::Reopen { .. } => show_main_window(app),
             RunEvent::WindowEvent { label, event, .. } => {
@@ -272,12 +312,179 @@ pub fn run() {
                 }
             }
             RunEvent::Exit => {
+                TRAY_MICROPHONE_WATCHER_STOPPING.store(true, Ordering::Relaxed);
                 let coordinator = app.state::<Arc<coordinator::Coordinator>>();
                 coordinator.stop_hotkey_listener();
                 coordinator.stop_qa_hotkey_listener();
+                coordinator.stop_combo_hotkey_listener();
+                coordinator.stop_translation_hotkey_listener();
+                coordinator.stop_switch_style_hotkey_listener();
+                coordinator.stop_open_app_hotkey_listener();
             }
             _ => {}
         });
+}
+
+struct MicrophoneTrayMenu {
+    submenu: Submenu<tauri::Wry>,
+    items: Vec<commands::TrayMicrophoneMenuItem>,
+}
+
+struct TrayMenu {
+    menu: Menu<tauri::Wry>,
+    microphone_items: Vec<commands::TrayMicrophoneMenuItem>,
+}
+
+fn build_tray_menu<M: Manager<tauri::Wry>>(
+    app: &M,
+    coordinator: &Arc<coordinator::Coordinator>,
+) -> tauri::Result<TrayMenu> {
+    let toggle = MenuItemBuilder::with_id("toggle", "显示主窗口").build(app)?;
+    let microphone_menu = build_microphone_tray_menu(app, coordinator)?;
+    let quit = MenuItemBuilder::with_id("quit", "退出 OpenLess").build(app)?;
+    let menu = MenuBuilder::new(app)
+        .items(&[&toggle, &microphone_menu.submenu, &quit])
+        .build()?;
+    Ok(TrayMenu {
+        menu,
+        microphone_items: microphone_menu.items,
+    })
+}
+
+fn build_microphone_tray_menu<M: Manager<tauri::Wry>>(
+    app: &M,
+    coordinator: &Arc<coordinator::Coordinator>,
+) -> tauri::Result<MicrophoneTrayMenu> {
+    let selected = coordinator.prefs().get().microphone_device_name;
+    let mut items = Vec::new();
+    let mut submenu = SubmenuBuilder::with_id(app, "microphone", "选择麦克风");
+    let devices = match recorder::list_input_devices() {
+        Ok(devices) => devices,
+        Err(err) => {
+            log::warn!("[tray] list microphone devices failed: {err}");
+            Vec::new()
+        }
+    };
+    let selected_available = selected.trim().is_empty()
+        || devices.iter().any(|device| device.name == selected);
+
+    let default_item = CheckMenuItemBuilder::with_id("mic-default", "系统默认麦克风")
+        .checked(selected.trim().is_empty() || !selected_available)
+        .build(app)?;
+    submenu = submenu.item(&default_item);
+    items.push(commands::TrayMicrophoneMenuItem {
+        id: "mic-default".to_string(),
+        device_name: String::new(),
+        item: default_item,
+    });
+
+    if devices.is_empty() {
+        let empty = MenuItemBuilder::with_id("mic-empty", "未发现麦克风")
+            .enabled(false)
+            .build(app)?;
+        submenu = submenu.item(&empty);
+    } else {
+            for (index, device) in devices.into_iter().enumerate() {
+                let id = format!("mic-device-{index}");
+                let label = if device.is_default {
+                    format!("{}（系统默认）", device.name)
+                } else {
+                    device.name.clone()
+                };
+                let item = CheckMenuItemBuilder::with_id(&id, label)
+                    .checked(selected == device.name)
+                    .build(app)?;
+                submenu = submenu.item(&item);
+                items.push(commands::TrayMicrophoneMenuItem {
+                    id,
+                    device_name: device.name,
+                    item,
+                });
+            }
+    }
+
+    Ok(MicrophoneTrayMenu {
+        submenu: submenu.build()?,
+        items,
+    })
+}
+
+pub(crate) fn refresh_tray_microphone_menu(app: &AppHandle) -> tauri::Result<()> {
+    let coordinator = app.state::<Arc<coordinator::Coordinator>>();
+    let tray_menu = build_tray_menu(app, &coordinator)?;
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        tray.set_menu(Some(tray_menu.menu))?;
+    }
+    let state = app.state::<commands::TrayMicrophoneMenuState>();
+    *state.lock() = tray_menu.microphone_items;
+    Ok(())
+}
+
+fn microphone_device_signature() -> Option<Vec<(String, bool)>> {
+    match recorder::list_input_devices() {
+        Ok(devices) => Some(
+            devices
+                .into_iter()
+                .map(|device| (device.name, device.is_default))
+                .collect(),
+        ),
+        Err(err) => {
+            log::warn!("[tray] watch microphone devices failed: {err}");
+            None
+        }
+    }
+}
+
+fn start_tray_microphone_watcher(app: AppHandle) {
+    TRAY_MICROPHONE_WATCHER_STOPPING.store(false, Ordering::Relaxed);
+    if let Err(err) = std::thread::Builder::new()
+        .name("openless-tray-mic-watch".into())
+        .spawn(move || {
+            let mut last_signature = microphone_device_signature();
+            while !TRAY_MICROPHONE_WATCHER_STOPPING.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1500));
+                if TRAY_MICROPHONE_WATCHER_STOPPING.load(Ordering::Relaxed) {
+                    break;
+                }
+                let signature = microphone_device_signature();
+                if signature == last_signature {
+                    continue;
+                }
+                last_signature = signature;
+                let app = app.clone();
+                let refresh_app = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    if let Err(err) = refresh_tray_microphone_menu(&refresh_app) {
+                        log::warn!("[tray] refresh microphone menu after device change failed: {err}");
+                    }
+                    let _ = refresh_app.emit("microphone:devices-changed", serde_json::json!({}));
+                });
+            }
+        }) {
+        log::warn!("[tray] start microphone watcher failed: {err}");
+    }
+}
+
+fn handle_microphone_tray_menu_event(
+    app: &AppHandle,
+    id: &str,
+) {
+    let tray_items = app.state::<commands::TrayMicrophoneMenuState>();
+    let items = tray_items.lock();
+    let Some(selected) = items.iter().find(|item| item.id == id) else {
+        return;
+    };
+
+    let coord = app.state::<Arc<coordinator::Coordinator>>();
+    let mut prefs = coord.prefs().get();
+    prefs.microphone_device_name = selected.device_name.clone();
+    if let Err(err) = coord.prefs().set(prefs.clone()) {
+        log::warn!("[tray] save microphone preference failed: {err}");
+        return;
+    }
+    let _ = app.emit("prefs:changed", &prefs);
+
+    commands::sync_tray_microphone_selection(&items, &selected.device_name);
 }
 
 #[cfg(target_os = "windows")]
@@ -770,8 +977,12 @@ struct CapsuleWindowBounds {
 fn capsule_window_bounds(translation_active: bool) -> CapsuleWindowBounds {
     #[cfg(target_os = "windows")]
     {
+        const WINDOWS_CAPSULE_PILL_WIDTH: f64 = 196.0;
+        const WINDOWS_CAPSULE_SIDE_INSET: f64 = 12.0;
         CapsuleWindowBounds {
-            width: 220.0,
+            // Keep the existing Windows hitbox width, but express it as
+            // pill width (196) + symmetric 12px side insets for shadow room.
+            width: WINDOWS_CAPSULE_PILL_WIDTH + WINDOWS_CAPSULE_SIDE_INSET * 2.0,
             height: if translation_active { 118.0 } else { 84.0 },
             bottom_inset: 12.0,
         }
